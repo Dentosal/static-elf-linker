@@ -5,10 +5,14 @@ use goblin::{
     elf64::{section_header::SHT_NOBITS, sym::*},
 };
 
-use crate::{FileLocation, GlobalLocation, ENTRYPOINT};
+use crate::{
+    open_files::{InputCache, InputId},
+    GlobalLocation, ENTRYPOINT,
+};
 
 fn extract_globals_from(
-    file_location: &FileLocation, _bytes: &[u8], elf: &Elf,
+    input: InputId,
+    elf: &Elf,
     global_symbols: &mut HashMap<String, GlobalLocation>,
 ) {
     // TODO: binding preference support
@@ -27,7 +31,7 @@ fn extract_globals_from(
         if sym.st_bind() == STB_GLOBAL && sym.st_visibility() != STV_HIDDEN && sym.st_shndx != 0 {
             // println!("^ export ^");
             let location = GlobalLocation {
-                file: file_location.clone(),
+                input,
                 symtab_index: sym_idx.try_into().expect("Symtab index overflow"),
             };
             let old = global_symbols.insert(name.to_string(), location.clone());
@@ -46,14 +50,11 @@ fn extract_globals_from(
     }
 }
 
-pub fn extract_globals(
-    input_files: &[FileLocation],
-) -> anyhow::Result<HashMap<String, GlobalLocation>> {
+pub fn extract_globals(inputs: &InputCache) -> anyhow::Result<HashMap<String, GlobalLocation>> {
     let mut global_symbols: HashMap<String, GlobalLocation> = HashMap::new();
-    for input in input_files {
-        input.run_for(|bytes, elf| {
-            extract_globals_from(input, bytes, elf, &mut global_symbols);
-        })?;
+    for input in inputs.iter_ids() {
+        let elf = inputs.get_elf(input);
+        extract_globals_from(input, elf, &mut global_symbols);
     }
     // dbg!(&global_symbols["_start"]);
     Ok(global_symbols)
@@ -65,9 +66,7 @@ pub enum NameResolved {
     Import,
 }
 
-pub fn resolve_name(
-    file_location: &FileLocation, _bytes: &[u8], elf: &Elf, name: &str,
-) -> Option<NameResolved> {
+pub fn resolve_name(elf: &Elf, name: &str) -> Option<NameResolved> {
     // println!("Resolving {name:?}");
 
     let strtab = elf.strtab.to_vec().unwrap();

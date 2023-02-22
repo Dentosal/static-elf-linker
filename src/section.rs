@@ -1,36 +1,98 @@
 use std::collections::{HashMap, HashSet};
+use std::io::Write;
+use std::ops::Range;
 
 use goblin::{
     elf::Elf,
     elf64::{header::*, reloc::*, section_header::*, sym::*},
-    mach::segment,
 };
 
 use crate::{
     config::Config,
     math::align_up,
-    name_resolution::{resolve_name, NameResolved},
+    open_files::{InputCache, InputId},
     permissions::Permissions,
     relocation::{self, apply_relocations, Relocate},
-    FileLocation, GlobalLocation,
+    GlobalLocation,
 };
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
+struct Patch {
+    offset: usize,
+    bytes: Vec<u8>,
+}
+
+#[derive(Debug, Clone, Copy)]
+#[must_use]
+pub enum InvalidPatch {
+    Overlapping,
+    NotInRange,
+}
+
+#[derive(Debug, Clone)]
 pub struct SectionChunk {
-    /// TODO: don't copy the bytes, and instead store a range into the original file
-    pub data: Vec<u8>,
-    pub file: FileLocation,
+    pub input: InputId,
+    pub range_in_input: Range<usize>,
     /// Index of section in the origin file, used by relocations
     pub section_index: u32,
     /// Alignment, extracted from the section header
     pub alignment: u64,
     pub permissions: Permissions,
     pub relocations: Vec<Relocate>,
+    /// Patches generated from relocations
+    /// Invariant: sorted
+    patches: Vec<Patch>,
 }
 
-fn build_section_from(
-    file_location: &FileLocation, bytes: &[u8], elf: &Elf, section_name: &str,
-) -> Vec<SectionChunk> {
+impl SectionChunk {
+    pub fn size(&self) -> u64 {
+        self.range_in_input.len() as u64
+    }
+
+    pub fn patch(&mut self, at: usize, bytes: Vec<u8>) -> Result<(), InvalidPatch> {
+        if at + bytes.len() >= self.size() as usize {
+            return Err(InvalidPatch::NotInRange);
+        }
+
+        if self.patches.is_empty() {
+            self.patches.push(Patch { offset: at, bytes });
+            return Ok(());
+        }
+
+        let index = self.patches.partition_point(|p| p.offset < at);
+        let prev = &self.patches[index - 1];
+        if prev.offset + prev.bytes.len() >= at {
+            return Err(InvalidPatch::Overlapping);
+        }
+
+        if let Some(next) = self.patches.get(index) {
+            if at + bytes.len() > next.offset {
+                return Err(InvalidPatch::Overlapping);
+            }
+        }
+
+        self.patches.push(Patch { offset: at, bytes });
+        return Ok(());
+    }
+
+    /// Write all patched bytes into a writer
+    pub fn write_finalized<T: Write>(
+        &self,
+        inputs: &InputCache,
+        target: &mut T,
+    ) -> std::io::Result<()> {
+        let bytes = &inputs.get_backing_bytes(self.input)[self.range_in_input.clone()];
+        let mut cursor = 0;
+        for patch in &self.patches {
+            target.write_all(&bytes[cursor..patch.offset])?;
+            target.write_all(&patch.bytes)?;
+            cursor = patch.offset + patch.bytes.len();
+        }
+        target.write_all(&bytes[cursor..])
+    }
+}
+
+fn build_section_from(input: InputId, elf: &Elf, section_name: &str) -> Vec<SectionChunk> {
     let mut result = Vec::new();
 
     for (i, section) in elf.section_headers.iter().enumerate() {
@@ -51,8 +113,8 @@ fn build_section_from(
             );
 
             result.push(SectionChunk {
-                data: bytes[section.file_range().unwrap()].to_vec(),
-                file: file_location.clone(),
+                input,
+                range_in_input: section.file_range().unwrap(),
                 section_index,
                 alignment: section.sh_addralign,
                 permissions: Permissions {
@@ -61,6 +123,7 @@ fn build_section_from(
                     execute: (section.sh_flags as u32) & SHF_EXECINSTR != 0,
                 },
                 relocations: relocation::extract(elf, section_index),
+                patches: Vec::new(),
             });
         }
     }
@@ -69,13 +132,14 @@ fn build_section_from(
 }
 
 fn build_section_group(
-    input_files: &[FileLocation], section_name: &str,
+    inputs: &InputCache,
+    section_name: &str,
 ) -> anyhow::Result<Vec<SectionChunk>> {
     let mut section = Vec::new();
 
-    for input in input_files {
-        let addition =
-            input.run_for(|bytes, elf| build_section_from(input, bytes, elf, section_name))?;
+    for input_id in inputs.iter_ids() {
+        let elf = inputs.get_elf(input_id);
+        let addition = build_section_from(input_id, elf, section_name);
         section.extend(addition);
     }
 
@@ -105,7 +169,7 @@ impl Section {
         let mut result = 0;
         for chunk in &self.chunks {
             result = align_up(result, chunk.alignment);
-            result += chunk.data.len() as u64;
+            result += chunk.size();
         }
         result
     }
@@ -157,7 +221,8 @@ impl LinkedProgram {
     }
 
     pub fn iter_with_positions<'a>(
-        &'a self, config: &'a Config,
+        &'a self,
+        config: &'a Config,
     ) -> impl Iterator<Item = ItChunk<'a>> {
         self.segments
             .iter()
@@ -190,7 +255,7 @@ impl LinkedProgram {
                             .scan(section_start, |addr, (si, chunk)| {
                                 *addr = align_up(*addr, chunk.alignment);
                                 if si > 0 {
-                                    *addr += section.chunks[si - 1].data.len() as u64;
+                                    *addr += section.chunks[si - 1].size();
                                     *addr = align_up(*addr, chunk.alignment);
                                 }
                                 Some((*addr, si, chunk))
@@ -225,12 +290,14 @@ pub struct ItChunk<'a> {
 
 /// Combine sections from different codegen units
 pub fn combine_sections(
-    config: &Config, input_files: &[FileLocation], section_names: &HashSet<String>,
+    config: &Config,
+    inputs: &InputCache,
+    section_names: &HashSet<String>,
 ) -> anyhow::Result<Vec<Section>> {
     let build_section_by_name = |section_name: &str| -> anyhow::Result<Section> {
         Ok(Section {
             name: section_name.to_owned(),
-            chunks: build_section_group(&input_files, section_name)?,
+            chunks: build_section_group(&inputs, section_name)?,
             permissions: Permissions::default(),
         })
     };
@@ -260,7 +327,9 @@ pub fn combine_sections(
 /// Segments are returned in sorted order, and the resulting value is essentially
 /// the loadable portion of the ELF file, excluding the BSS segment.
 pub fn sections_to_segments(
-    config: &Config, input_files: &[FileLocation], mut sections: Vec<Section>,
+    config: &Config,
+    inputs: &InputCache,
+    mut sections: Vec<Section>,
 ) -> anyhow::Result<LinkedProgram> {
     // TODO: configurable segment/section order and grouping
 
@@ -303,12 +372,14 @@ pub fn sections_to_segments(
 }
 
 pub fn build(
-    config: &Config, input_files: &[FileLocation], section_names: &HashSet<String>,
+    config: &Config,
+    inputs: &InputCache,
+    section_names: &HashSet<String>,
     globals: &HashMap<String, GlobalLocation>,
 ) -> anyhow::Result<LinkedProgram> {
-    let sections = combine_sections(config, input_files, section_names)?;
-    let mut linked = sections_to_segments(config, input_files, sections)?;
+    let sections = combine_sections(config, inputs, section_names)?;
+    let mut linked = sections_to_segments(config, inputs, sections)?;
     // TODO: dead code elimination
-    apply_relocations(config, input_files, &mut linked, globals)?;
+    apply_relocations(config, inputs, &mut linked, globals)?;
     Ok(linked)
 }

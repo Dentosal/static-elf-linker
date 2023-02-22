@@ -25,32 +25,32 @@ pub fn read() -> Args {
                 } else {
                     log::debug!("Ignoring a non-dir -L path {path:?}");
                 }
-            },
+            }
             "-o" => {
                 let path = args.next().expect("-o value missing");
                 let path = PathBuf::try_from(path).expect("Invalid path");
                 output = Some(path);
-            },
+            }
             // Ignore: Single-dash, single-value options
             "-flavor" => {
                 let _ = args.next().expect("-flavor value missing");
-            },
+            }
             // Ignore: No-value options
-            "-nmagic" | "-Bstatic" | "-Bdynamic" | "--as-needed" | "--eh-frame-hdr"
-            | "-znoexecstack" | "--gc-sections" | "-O1" => {},
+            "-nmagic" | "-Bstatic" | "-Bdynamic" | "-Wl,--as-needed" | "--as-needed"
+            | "--eh-frame-hdr" | "-znoexecstack" | "--gc-sections" | "-O1" | "-pie" => {}
             // Ignore: Known equals-options
-            _ if arg.starts_with("--script=") => {},
-            _ if arg.starts_with("-z") && arg.contains('=') => {},
+            _ if arg.starts_with("--script=") => {}
+            _ if arg.starts_with("-z") && arg.contains('=') => {}
             // Not supported yet
             other if arg.starts_with('-') => {
                 panic!("Unknown option {other:?}");
-            },
+            }
             // Input files
             _ => {
                 let path = PathBuf::try_from(arg).expect("Invalid path");
                 assert!(path.is_file(), "input path must be a file ({path:?})");
                 inputs.push(path);
-            },
+            }
         }
     }
 

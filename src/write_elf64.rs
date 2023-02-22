@@ -3,11 +3,14 @@
 use std::io::Write;
 
 use crate::{
-    config::Config, math::align_up, permissions::Permissions, section::LinkedProgram, Section,
+    config::Config, math::align_up, open_files::InputCache, permissions::Permissions,
+    section::LinkedProgram, Section,
 };
 
 pub fn write_file_header<T: Write>(
-    target: &mut T, entry_point: u64, program_header_count: u16,
+    target: &mut T,
+    entry_point: u64,
+    program_header_count: u16,
 ) -> anyhow::Result<()> {
     // Magic number
     target.write_all(&[0x7f, b'E', b'L', b'F'])?;
@@ -81,8 +84,15 @@ mod program_header_type {
 }
 
 pub fn write_program_header<T: Write>(
-    target: &mut T, type_: u32, flags: u32, offset: u64, v_addr: u64, p_addr: u64, filesz: u64,
-    memsz: u64, align: u64,
+    target: &mut T,
+    type_: u32,
+    flags: u32,
+    offset: u64,
+    v_addr: u64,
+    p_addr: u64,
+    filesz: u64,
+    memsz: u64,
+    align: u64,
 ) -> anyhow::Result<()> {
     target.write_all(&type_.to_le_bytes())?;
     target.write_all(&flags.to_le_bytes())?;
@@ -96,7 +106,10 @@ pub fn write_program_header<T: Write>(
 }
 
 pub fn write<T: Write>(
-    config: &Config, target: &mut T, linked: &LinkedProgram,
+    config: &Config,
+    inputs: &InputCache,
+    target: &mut T,
+    linked: &LinkedProgram,
 ) -> anyhow::Result<()> {
     // TODO: merge sections into program headers at some point
 
@@ -152,7 +165,7 @@ pub fn write<T: Write>(
             }
 
             for chunk in &section.chunks {
-                target.write_all(&chunk.data)?;
+                chunk.write_finalized(inputs, target)?;
 
                 // Align to chunk alignment
                 let align_amount = align_up(position, chunk.alignment) - position;
@@ -161,7 +174,7 @@ pub fn write<T: Write>(
                     target.write_all(&[0])?;
                 }
 
-                position += chunk.data.len() as u64;
+                position += chunk.size();
             }
         }
 

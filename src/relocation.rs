@@ -14,11 +14,12 @@ use crate::{
     math::align_up,
     name_resolution::resolve_name,
     name_resolution::NameResolved,
+    open_files::{InputCache, InputId},
     section::{ItChunk, LinkedProgram},
-    FileLocation, GlobalLocation,
+    GlobalLocation,
 };
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct Relocate {
     /// Location to patch, in the original input file section
     patch_offset: u64,
@@ -30,7 +31,7 @@ pub struct Relocate {
     relative_offset: i64,
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub enum RelativeTo {
     /// Start of a section in the same compilation unit as the relocation
     Section { index: usize },
@@ -70,7 +71,9 @@ pub fn extract(elf: &Elf, target_section_index: u32) -> Vec<Relocate> {
 }
 
 pub fn apply_relocations(
-    config: &Config, input_files: &[FileLocation], linked: &mut LinkedProgram,
+    config: &Config,
+    inputs: &InputCache,
+    linked: &mut LinkedProgram,
     globals: &HashMap<String, GlobalLocation>,
 ) -> anyhow::Result<()> {
     let mut chunk_starts = linked
@@ -79,14 +82,14 @@ pub fn apply_relocations(
         .collect::<Vec<_>>()
         .into_iter();
 
-    let mut anchors = resolve_relocation_symbols(config, linked, globals)?.into_iter();
+    let mut anchors = resolve_relocation_symbols(config, inputs, linked, globals)?.into_iter();
 
     for segment in linked.segments.iter_mut() {
         for section in segment.sections.iter_mut() {
             for chunk in section.chunks.iter_mut() {
                 let cs = chunk_starts.next().unwrap();
 
-                for reloc in chunk.relocations.iter_mut() {
+                for reloc in chunk.clone().relocations.into_iter() {
                     let RelocationComputed {
                         relative_to: anchor,
                         chunk_start: _,
@@ -95,6 +98,9 @@ pub fn apply_relocations(
 
                     let resolved_address = config.base_addr.checked_add(anchor).unwrap();
                     let patch_pos = reloc.patch_offset as usize;
+
+                    let backing_bytes =
+                        &inputs.get_backing_bytes(chunk.input)[chunk.range_in_input.clone()];
 
                     // Patch
                     // See: https://docs.rs/goblin/latest/goblin/elf/reloc/index.html
@@ -106,10 +112,15 @@ pub fn apply_relocations(
 
                             let final_value: i32 = final_value.try_into().expect("Overflow");
 
-                            let slice = &mut chunk.data[patch_pos..patch_pos + 4];
-                            assert_eq!(slice, &[0; 4], "Must only patch over zeroes");
-                            slice.copy_from_slice(&final_value.to_le_bytes());
-                        },
+                            assert_eq!(
+                                &backing_bytes[patch_pos..patch_pos + 4],
+                                &[0; 4],
+                                "Must only patch over zeroes"
+                            );
+                            chunk
+                                .patch(patch_pos, final_value.to_le_bytes().to_vec())
+                                .expect("Invalid patch");
+                        }
                         R_X86_64_64 => {
                             let final_value: u64 =
                                 (resolved_address as i64 + reloc.relative_offset) as u64;
@@ -119,10 +130,15 @@ pub fn apply_relocations(
                             //     r_to_str(reloc.mode, EM_X86_64)
                             // );
 
-                            let slice = &mut chunk.data[patch_pos..patch_pos + 8];
-                            assert_eq!(slice, &[0; 8], "Must only patch over zeroes");
-                            slice.copy_from_slice(&final_value.to_le_bytes());
-                        },
+                            assert_eq!(
+                                &backing_bytes[patch_pos..patch_pos + 8],
+                                &[0; 8],
+                                "Must only patch over zeroes"
+                            );
+                            chunk
+                                .patch(patch_pos, final_value.to_le_bytes().to_vec())
+                                .expect("Invalid patch");
+                        }
                         _ => panic!(
                             "Unknown relocation type: {}",
                             r_to_str(reloc.mode, EM_X86_64)
@@ -147,7 +163,10 @@ struct RelocationComputed {
 /// Resolve:
 /// * relative addresses used by the relocs
 fn resolve_relocation_symbols(
-    config: &Config, linked: &LinkedProgram, globals: &HashMap<String, GlobalLocation>,
+    config: &Config,
+    inputs: &InputCache,
+    linked: &LinkedProgram,
+    globals: &HashMap<String, GlobalLocation>,
 ) -> anyhow::Result<Vec<RelocationComputed>> {
     linked.iter_with_positions(config).map(|
             ItChunk {
@@ -158,58 +177,56 @@ fn resolve_relocation_symbols(
         let (relative_to, offset) = match &reloc.relative_to {
             RelativeTo::Section { index } => {
                 // Get start of section at index of the current chunk file
-                let section_addr = lookup_input_section_addr(&linked, config, &chunk.file, *index).expect("Couln't resolve section in index");
+                let section_addr = lookup_input_section_addr(&linked, config, chunk.input, *index).expect("Couln't resolve section in index");
                 (section_addr, 0)
             },
             RelativeTo::Symbol(name) => {
-                let resolved = chunk
-                    .file
-                    .run_for(|bytes, elf| resolve_name(&chunk.file, bytes, elf, &name))?
+                let elf = inputs.get_elf(chunk.input);
+                let resolved = resolve_name(elf, &name)
                     .ok_or_else(|| {
-                        anyhow::anyhow!(
+                        anyhow::anyhow!( // TODO: file name lookup
                             "Unable to resolve symbol {name:?} in {:?}",
-                            chunk.file
+                            chunk.input
                         )
                     })?;
 
                 match resolved {
                     NameResolved::Local(_) => {
-                        todo!("Get local symbol {name:?} of file {:?}", chunk.file)
+                        todo!("Get local symbol {name:?} of file {:?}", chunk.input) // TODO: file name lookup
                     },
                     NameResolved::Import => {
                         let glob = globals.get(name.as_str()).ok_or_else(|| {
                             anyhow::anyhow!(
-                                "Unable to resolve imported symbol {name:?} in {:?}",
-                                chunk.file
+                                "Unable to resolve imported symbol {name:?} in {}",
+                                inputs.description(chunk.input)
                             )
                         })?;
 
                         // Get position of symbol in glob.symtab_index of glob.file
-                        let (section_index, offset) =
-                            glob.file.run_for(|_file, elf| {
-                                let sym = elf
-                                    .syms
-                                    .get(glob.symtab_index as usize)
-                                    .expect("Missing symbol");
+                        let import_elf = inputs.get_elf(glob.input);
+                        let sym = import_elf
+                            .syms
+                            .get(glob.symtab_index as usize)
+                            .expect("Missing symbol");
 
-                                // Binding rules are enforced when creating the global map, so no need to check here
-                                (sym.st_shndx, sym.st_value)
-                            })?;
+                        // Binding rules are enforced when creating the global map, so no need to check here
+                        let section_index = sym.st_shndx;
+                        let offset = sym.st_value;
 
                         if let Some(itc) = linked.iter_with_positions(config).find(|
                             it
                         | {
-                            it.chunk.file == glob.file && it.chunk.section_index == (section_index as u32)
+                            it.chunk.input == glob.input && it.chunk.section_index == section_index as u32
                         }) {
                             let addr = itc.chunk_start;
                             (addr, offset)
                         } else {
-                            todo!(
-                                "Section with symtab index {} from file {:?} was not included in segments, but it contains global {name:?} referenced by a relocation {:?} in {:?}",
+                            todo!( // TODO: convert .input to paths
+                                "Section with symtab index {} from {} was not included in segments, but it contains global {name:?} referenced by a relocation {:?} in {}",
                                 glob.symtab_index,
-                                glob.file,
+                                inputs.description(glob.input),
                                 reloc,
-                                chunk.file,
+                                inputs.description(chunk.input),
                             );
                         }
                     },
@@ -225,7 +242,10 @@ fn resolve_relocation_symbols(
 /// Resolve a final address for an input file section
 /// TODO: build a lookup table for these before
 fn lookup_input_section_addr(
-    linked: &LinkedProgram, config: &Config, file: &FileLocation, section_index: usize,
+    linked: &LinkedProgram,
+    config: &Config,
+    input: InputId,
+    section_index: usize,
 ) -> Option<u64> {
     let mut addr = 0;
     for segment in linked.segments.iter() {
@@ -233,10 +253,10 @@ fn lookup_input_section_addr(
             addr = align_up(addr, section.alignment());
             for chunk in section.chunks.iter() {
                 addr = align_up(addr, chunk.alignment);
-                if chunk.file == *file && chunk.section_index == (section_index as u32) {
+                if chunk.input == input && chunk.section_index == (section_index as u32) {
                     return Some(addr);
                 }
-                addr += chunk.data.len() as u64;
+                addr += chunk.size();
             }
         }
         addr = align_up(segment.size(), segment.alignment().max(config.page_size));

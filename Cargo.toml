@@ -8,3 +8,5 @@ publish = false
 anyhow = "1.0"
 log = "0.4"
 goblin = "0.6"
+memmap = "0.7.0"
+itertools = "0.10"
